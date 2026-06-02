@@ -1,5 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, Loader2, CheckCircle, AlertCircle } from 'lucide-react';
+import {
+    createPerplexityAuthHeader,
+    createPerplexityValidationBody,
+    formatPerplexityErrorMessage,
+    normalizeApiKey,
+} from '../lib/perplexity';
 
 const App: React.FC = () => {
     const [apiKey, setApiKey] = useState('');
@@ -17,7 +23,9 @@ const App: React.FC = () => {
     }, []);
 
     const handleSave = async () => {
-        if (!apiKey.trim()) {
+        const trimmedApiKey = normalizeApiKey(apiKey);
+
+        if (!trimmedApiKey) {
             setStatus('error');
             setMessage('Please enter an API key');
             return;
@@ -32,28 +40,29 @@ const App: React.FC = () => {
                 {
                     method: 'POST',
                     headers: {
-                        'Authorization': `Bearer ${apiKey}`,
+                        'Authorization': createPerplexityAuthHeader(trimmedApiKey),
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        model: 'sonar',
-                        messages: [{ role: 'user', content: 'Test' }],
-                        max_tokens: 10,
-                    }),
+                    body: JSON.stringify(createPerplexityValidationBody()),
                 }
             );
 
             if (!response.ok) {
-                throw new Error('Invalid API key');
+                const errorData = await response.json().catch(() => ({}));
+                const providerMessage = typeof errorData.error?.message === 'string'
+                    ? errorData.error.message
+                    : undefined;
+                throw new Error(formatPerplexityErrorMessage(response.status, providerMessage));
             }
 
-            chrome.storage.sync.set({ perplexityApiKey: apiKey }, () => {
+            chrome.storage.sync.set({ perplexityApiKey: trimmedApiKey }, () => {
+                setApiKey(trimmedApiKey);
                 setStatus('success');
                 setMessage('Configuration saved successfully');
             });
         } catch (error) {
             setStatus('error');
-            setMessage('Invalid API key. Please check and try again.');
+            setMessage(error instanceof Error ? error.message : 'Unable to validate the Perplexity API key.');
         }
     };
 

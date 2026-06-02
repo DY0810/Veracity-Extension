@@ -9,9 +9,11 @@ export interface ScanResponse {
     error?: string;
 }
 
+export type FactCheckVerdict = 'true' | 'false' | 'context' | 'unverified';
+
 export interface FactCheckResult {
     quote: string;
-    verdict: 'true' | 'false' | 'context';
+    verdict: FactCheckVerdict;
     claim: string;
     comments: string;
     source: string;

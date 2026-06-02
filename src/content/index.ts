@@ -1,9 +1,193 @@
-import type { ScanResponse, FactCheckResult } from '../types';
+import type { FactCheckResult, FactCheckVerdict, ScanResponse } from '../types';
 
 let statusCard: HTMLElement | null = null;
 
+interface VerdictCounts {
+  true: number;
+  context: number;
+  false: number;
+  unverified: number;
+  unmatched: number;
+}
+
+interface ArticleTextPayload {
+  text: string;
+  truncated: boolean;
+  includedCharacters: number;
+  totalCharacters: number;
+}
+
+interface VerdictPresentation {
+  label: string;
+  badgeColor: string;
+  backgroundColor: string;
+  borderColor: string;
+  textColor: string;
+  icon: string;
+}
+
 // Track matched counts globally
-let matchedCounts = { false: 0, context: 0, true: 0 };
+let matchedCounts: VerdictCounts = { false: 0, context: 0, true: 0, unverified: 0, unmatched: 0 };
+
+function normalizeVerdict(value: unknown): FactCheckVerdict {
+  return value === 'true' || value === 'false' || value === 'context' || value === 'unverified'
+    ? value
+    : 'unverified';
+}
+
+function calculateIntegrityScore(counts: VerdictCounts) {
+  const verifiedClaims = counts.true + counts.context + counts.false;
+  const totalClaims = verifiedClaims + counts.unverified + counts.unmatched;
+  const score = verifiedClaims > 0
+    ? Math.round(((counts.true + counts.context * 0.5) / verifiedClaims) * 100)
+    : null;
+
+  return {
+    score,
+    verifiedClaims,
+    totalClaims,
+  };
+}
+
+function getVerdictPresentation(verdict: FactCheckVerdict): VerdictPresentation {
+  switch (verdict) {
+    case 'false':
+      return {
+        label: 'False',
+        badgeColor: '#EF4444',
+        backgroundColor: '#fee2e2',
+        borderColor: '#dc2626',
+        textColor: '#991b1b',
+        icon: 'x',
+      };
+    case 'context':
+      return {
+        label: 'Needs Context',
+        badgeColor: '#F59E0B',
+        backgroundColor: '#fef3c7',
+        borderColor: '#f59e0b',
+        textColor: '#92400e',
+        icon: '!',
+      };
+    case 'true':
+      return {
+        label: 'True',
+        badgeColor: '#10B981',
+        backgroundColor: '#d1fae5',
+        borderColor: '#059669',
+        textColor: '#065f46',
+        icon: '✓',
+      };
+    case 'unverified':
+      return {
+        label: 'Unverified',
+        badgeColor: '#64748B',
+        backgroundColor: '#f1f5f9',
+        borderColor: '#64748b',
+        textColor: '#334155',
+        icon: '?',
+      };
+  }
+}
+
+function buildArticleTextPayload(blocks: string[], limit = 15000): ArticleTextPayload {
+  const seen = new Set<string>();
+  const uniqueBlocks = blocks
+    .map((block) => block.trim())
+    .filter((block) => {
+      if (!block || seen.has(block)) {
+        return false;
+      }
+      seen.add(block);
+      return true;
+    });
+
+  const fullText = uniqueBlocks.join('\n\n');
+  const text = fullText.length > limit ? fullText.slice(0, limit) : fullText;
+
+  return {
+    text,
+    truncated: fullText.length > limit,
+    includedCharacters: text.length,
+    totalCharacters: fullText.length,
+  };
+}
+
+function normalizeText(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/[""]/g, '"')
+    .replace(/['']/g, "'")
+    .replace(/[–—]/g, '-')
+    .trim()
+    .toLowerCase();
+}
+
+function stripPunctuation(text: string): string {
+  return normalizeText(text).replace(/[.,!?;:()]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function toDistinctiveWords(text: string): string[] {
+  const stopWords = new Set([
+    'the',
+    'and',
+    'for',
+    'with',
+    'that',
+    'this',
+    'from',
+    'after',
+    'before',
+    'into',
+    'over',
+    'under',
+    'last',
+    'night',
+  ]);
+
+  return stripPunctuation(text)
+    .split(' ')
+    .filter((word) => word.length > 2 && !stopWords.has(word));
+}
+
+function fuzzyMatch(haystack: string, needle: string) {
+  const normHaystack = normalizeText(haystack);
+  const normNeedle = normalizeText(needle);
+
+  if (!normNeedle) {
+    return { match: false, startIndex: 0, endIndex: 0 };
+  }
+
+  const exactIndex = normHaystack.indexOf(normNeedle);
+  if (exactIndex !== -1) {
+    return { match: true, startIndex: exactIndex, endIndex: exactIndex + normNeedle.length };
+  }
+
+  const cleanHaystack = stripPunctuation(haystack);
+  const cleanNeedle = stripPunctuation(needle);
+  const cleanIndex = cleanHaystack.indexOf(cleanNeedle);
+  if (cleanNeedle.length >= 12 && cleanIndex !== -1) {
+    return { match: true, startIndex: cleanIndex, endIndex: cleanIndex + cleanNeedle.length };
+  }
+
+  const needleWords = toDistinctiveWords(needle);
+  if (needleWords.length < 4) {
+    return { match: false, startIndex: 0, endIndex: 0 };
+  }
+
+  const cleanWords = cleanHaystack.split(' ');
+  for (let windowSize = Math.min(needleWords.length, 6); windowSize >= 4; windowSize--) {
+    for (let i = 0; i <= needleWords.length - windowSize; i++) {
+      const phrase = needleWords.slice(i, i + windowSize).join(' ');
+      const start = cleanHaystack.indexOf(phrase);
+      if (start !== -1 && cleanWords.includes(needleWords[i])) {
+        return { match: true, startIndex: start, endIndex: start + phrase.length };
+      }
+    }
+  }
+
+  return { match: false, startIndex: 0, endIndex: 0 };
+}
 
 chrome.runtime.onMessage.addListener((request: { type: string }, _sender: chrome.runtime.MessageSender, sendResponse: (response: { success: boolean; count?: number }) => void) => {
   if (request.type === 'TRIGGER_SCAN') {
@@ -67,13 +251,15 @@ function showLoadingCard() {
   document.body.appendChild(statusCard);
 }
 
-function showScoreCard(falseCount: number, contextCount: number, trueCount: number) {
+function showScoreCard(counts: VerdictCounts) {
   if (!statusCard) return;
 
-  const totalClaims = falseCount + contextCount + trueCount;
-  const score = totalClaims > 0 ? Math.round(((trueCount + (contextCount * 0.5)) / totalClaims) * 100) : 100;
+  const result = calculateIntegrityScore(counts);
+  const score = result.score;
 
-  const scoreColor = score > 80 ? '#059669' : score > 50 ? '#f59e0b' : '#dc2626';
+  const scoreColor = score === null ? '#64748B' : score > 80 ? '#059669' : score > 50 ? '#f59e0b' : '#dc2626';
+  const scoreValue = score ?? 0;
+  const scoreLabel = score === null ? 'N/A' : String(score);
 
   // Transition the same card
   statusCard.style.opacity = '0';
@@ -115,31 +301,39 @@ function showScoreCard(falseCount: number, contextCount: number, trueCount: numb
               stroke-width="6" 
               fill="transparent"
               stroke-dasharray="283"
-              stroke-dashoffset="${283 - (283 * score / 100)}"
+              stroke-dashoffset="${283 - (283 * scoreValue / 100)}"
               style="transition: stroke-dashoffset 1s ease;"
             />
           </svg>
           <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
-            <div style="font-size: 32px; font-weight: bold; color: ${scoreColor};">${score}</div>
+            <div style="font-size: 32px; font-weight: bold; color: ${scoreColor};">${scoreLabel}</div>
             <div style="font-size: 10px; color: #9ca3af; text-transform: uppercase;">Score</div>
           </div>
         </div>
-        <div style="border-top: 1px solid #e5e7eb; padding-top: 12px; display: flex; justify-content: space-around; font-size: 11px;">
+        <div style="border-top: 1px solid #e5e7eb; padding-top: 12px; display: flex; justify-content: space-around; gap: 10px; flex-wrap: wrap; font-size: 11px;">
           <div style="text-align: center;">
-            <div style="font-weight: 600; color: #059669;">${trueCount}</div>
+            <div style="font-weight: 600; color: #059669;">${counts.true}</div>
             <div style="color: #9ca3af;">True</div>
           </div>
           <div style="text-align: center;">
-            <div style="font-weight: 600; color: #f59e0b;">${contextCount}</div>
+            <div style="font-weight: 600; color: #f59e0b;">${counts.context}</div>
             <div style="color: #9ca3af;">Context</div>
           </div>
           <div style="text-align: center;">
-            <div style="font-weight: 600; color: #dc2626;">${falseCount}</div>
+            <div style="font-weight: 600; color: #dc2626;">${counts.false}</div>
             <div style="color: #9ca3af;">False</div>
+          </div>
+          <div style="text-align: center;">
+            <div style="font-weight: 600; color: #64748B;">${counts.unverified}</div>
+            <div style="color: #9ca3af;">Unverified</div>
+          </div>
+          <div style="text-align: center;">
+            <div style="font-weight: 600; color: #6b7280;">${counts.unmatched}</div>
+            <div style="color: #9ca3af;">Unmatched</div>
           </div>
         </div>
         <div style="margin-top: 8px; font-size: 9px; color: #9ca3af;">
-          ${totalClaims} verified claims
+          ${result.verifiedClaims} verified of ${result.totalClaims} claims
         </div>
       </div>
     `;
@@ -169,16 +363,20 @@ function hideStatusCard() {
 }
 
 async function scanPage() {
-  const text = extractVisibleText();
-  console.log('[Veracity] Extracted text length:', text.length);
+  const articleText = extractVisibleText();
+  console.log('[Veracity] Extracted text length:', articleText.text.length);
 
-  if (!text) {
+  if (!articleText.text) {
     throw new Error('No readable text found on this page.');
+  }
+
+  if (articleText.truncated) {
+    showToast('Long page detected. Veracity scanned the first portion of readable article text.', 'info');
   }
 
   const response = await chrome.runtime.sendMessage({
     type: 'SCAN_REQUEST',
-    text,
+    text: articleText.text,
   }) as ScanResponse;
 
   console.log('[Veracity] API Response:', response);
@@ -188,7 +386,7 @@ async function scanPage() {
     console.log('[Veracity] Claims data:', response.data);
 
     // Reset matched counts before displaying badges
-    matchedCounts = { false: 0, context: 0, true: 0 };
+    matchedCounts = { false: 0, context: 0, true: 0, unverified: 0, unmatched: 0 };
 
     displayClaimBadges(response.data);
     // Score card will be shown after badges are created with actual matched counts
@@ -206,94 +404,16 @@ async function scanPage() {
   }
 }
 
-function extractVisibleText(): string {
+function extractVisibleText(): ArticleTextPayload {
   const elements = document.querySelectorAll('article p, p, h1, h2, h3, h4, h5, h6, li');
-  let text = '';
+  const blocks: string[] = [];
   elements.forEach((el) => {
     const htmlEl = el as HTMLElement;
     if (htmlEl.innerText && htmlEl.offsetParent !== null) {
-      text += htmlEl.innerText + '\n\n';
+      blocks.push(htmlEl.innerText);
     }
   });
-  return text.slice(0, 15000);
-}
-
-function normalizeText(text: string): string {
-  return text
-    .replace(/\s+/g, ' ')
-    .replace(/[""]/g, '"')
-    .replace(/['']/g, "'")
-    .replace(/[–—]/g, '-')
-    .trim()
-    .toLowerCase();
-}
-
-function fuzzyMatch(haystack: string, needle: string): { match: boolean; startIndex: number; endIndex: number } {
-  const normHaystack = normalizeText(haystack);
-  const normNeedle = normalizeText(needle);
-
-  // Strategy 1: Exact match
-  const exactIndex = normHaystack.indexOf(normNeedle);
-  if (exactIndex !== -1) {
-    return { match: true, startIndex: exactIndex, endIndex: exactIndex + normNeedle.length };
-  }
-
-  // Strategy 2: Match first and last 5 words (for longer quotes)
-  const needleWords = normNeedle.split(' ').filter(w => w.length > 2);
-  if (needleWords.length >= 5) {
-    const firstWords = needleWords.slice(0, 5).join(' ');
-    const lastWords = needleWords.slice(-5).join(' ');
-
-    if (normHaystack.includes(firstWords) && normHaystack.includes(lastWords)) {
-      const start = normHaystack.indexOf(firstWords);
-      const end = normHaystack.indexOf(lastWords) + lastWords.length;
-      return { match: true, startIndex: start, endIndex: end };
-    }
-  }
-
-  // Strategy 3: Match first 3 words only (aggressive partial match)
-  if (needleWords.length >= 3) {
-    const firstThree = needleWords.slice(0, 3).join(' ');
-    if (normHaystack.includes(firstThree)) {
-      const start = normHaystack.indexOf(firstThree);
-      return { match: true, startIndex: start, endIndex: start + 100 };
-    }
-  }
-
-  // Strategy 4: Match ANY 4 consecutive words from the quote
-  if (needleWords.length >= 4) {
-    for (let i = 0; i <= needleWords.length - 4; i++) {
-      const fourWords = needleWords.slice(i, i + 4).join(' ');
-      if (normHaystack.includes(fourWords)) {
-        const start = normHaystack.indexOf(fourWords);
-        return { match: true, startIndex: start, endIndex: start + 100 };
-      }
-    }
-  }
-
-  // Strategy 5: Match at least 50% of words (very lenient)
-  if (needleWords.length >= 3) {
-    const matchedWords = needleWords.filter(word => normHaystack.includes(word));
-    const matchPercent = matchedWords.length / needleWords.length;
-
-    if (matchPercent >= 0.5) {
-      // Find approximate position of first matched word
-      const firstMatch = matchedWords[0];
-      const start = normHaystack.indexOf(firstMatch);
-      return { match: true, startIndex: start, endIndex: start + 100 };
-    }
-  }
-
-  // Strategy 6: Try removing punctuation and matching
-  const cleanNeedle = normNeedle.replace(/[.,!?;:()]/g, ' ').replace(/\s+/g, ' ');
-  const cleanHaystack = normHaystack.replace(/[.,!?;:()]/g, ' ').replace(/\s+/g, ' ');
-
-  if (cleanHaystack.includes(cleanNeedle)) {
-    const start = cleanHaystack.indexOf(cleanNeedle);
-    return { match: true, startIndex: start, endIndex: start + cleanNeedle.length };
-  }
-
-  return { match: false, startIndex: 0, endIndex: 0 };
+  return buildArticleTextPayload(blocks);
 }
 
 const observer = new IntersectionObserver((entries) => {
@@ -314,16 +434,19 @@ function displayClaimBadges(results: FactCheckResult[]) {
   document.querySelectorAll('.veracity-highlight-bracket').forEach(el => el.remove());
 
   let matchedCount = 0;
-  let unmatchedClaims: string[] = [];
+  const unmatchedClaims: string[] = [];
   let skippedElements = 0;
+  const claimsByElement = new Map<HTMLElement, FactCheckResult[]>();
 
-  results.forEach((result, index) => {
+  results.forEach((rawResult, index) => {
+    const result = { ...rawResult, verdict: normalizeVerdict(rawResult.verdict) };
     console.log(`[Veracity] Processing claim ${index + 1}/${results.length}:`, result.quote);
 
     const quote = result.quote;
     if (!quote) {
       console.warn(`[Veracity] Claim ${index + 1} has no quote`);
       unmatchedClaims.push(`Claim ${index + 1}: NO QUOTE`);
+      matchedCounts.unmatched++;
       return;
     }
 
@@ -372,36 +495,35 @@ function displayClaimBadges(results: FactCheckResult[]) {
       if (matchResult.match) {
         console.log(`[Veracity] ✓ MATCHED claim ${index + 1} in element`);
 
-        try {
-          // Skip if this element already has a badge
-          if (htmlEl.querySelector('.veracity-compact-badge')) {
-            console.log(`[Veracity] Element already has badge, trying next match`);
-            continue;
-          }
-
-          createCompactBadge(htmlEl, [result]);
-          observer.observe(htmlEl);
-          matchedCount++;
-          found = true;
-          break;
-        } catch (badgeError) {
-          console.error(`[Veracity] Failed to create badge for claim ${index + 1}:`, badgeError);
-          console.error('[Veracity] Error details:', badgeError);
-          skippedElements++;
-          // Try next match instead of giving up
-          continue;
-        }
+        const claims = claimsByElement.get(htmlEl) ?? [];
+        claims.push(result);
+        claimsByElement.set(htmlEl, claims);
+        matchedCount++;
+        matchedCounts[result.verdict]++;
+        found = true;
+        break;
       }
     }
 
     if (!found) {
       console.warn(`[Veracity] ✗ UNMATCHED claim ${index + 1}: "${quote.substring(0, 50)}..."`);
       unmatchedClaims.push(`"${quote.substring(0, 60)}..."`);
-    } else {
-      // Increment matched counts for score card
-      if (result.verdict === 'false') matchedCounts.false++;
-      else if (result.verdict === 'context') matchedCounts.context++;
-      else if (result.verdict === 'true') matchedCounts.true++;
+      matchedCounts.unmatched++;
+    }
+  });
+
+  claimsByElement.forEach((claims, htmlEl) => {
+    try {
+      createCompactBadge(htmlEl, claims);
+      observer.observe(htmlEl);
+    } catch (badgeError) {
+      console.error('[Veracity] Failed to create badge for matched element:', badgeError);
+      console.error('[Veracity] Error details:', badgeError);
+      skippedElements += claims.length;
+      matchedCounts.unmatched += claims.length;
+      claims.forEach((claim) => {
+        matchedCounts[claim.verdict]--;
+      });
     }
   });
 
@@ -415,7 +537,14 @@ function displayClaimBadges(results: FactCheckResult[]) {
   }
 
   // Update score card with actual matched counts
-  showScoreCard(matchedCounts.false, matchedCounts.context, matchedCounts.true);
+  showScoreCard(matchedCounts);
+}
+
+function selectPrimaryClaim(claims: FactCheckResult[]): FactCheckResult {
+  const severityOrder = ['false', 'context', 'unverified', 'true'];
+  return [...claims].sort((a, b) =>
+    severityOrder.indexOf(a.verdict) - severityOrder.indexOf(b.verdict)
+  )[0];
 }
 
 function createCompactBadge(element: HTMLElement, claims: FactCheckResult[]): void {
@@ -448,22 +577,14 @@ function createCompactBadge(element: HTMLElement, claims: FactCheckResult[]): vo
       // Continue anyway, might still work
     }
 
-    const claim = claims[0];
+    const claim = selectPrimaryClaim(claims);
     if (!claim) {
       throw new Error('No claim data provided');
     }
 
-    let badgeColor, icon;
-    if (claim.verdict === 'false') {
-      badgeColor = '#EF4444'; // Modern red
-      icon = '✕';
-    } else if (claim.verdict === 'context') {
-      badgeColor = '#F59E0B'; // Amber/Orange
-      icon = '!';
-    } else {
-      badgeColor = '#10B981'; // Emerald green/teal
-      icon = '✓';
-    }
+    const presentation = getVerdictPresentation(claim.verdict);
+    const badgeColor = presentation.badgeColor;
+    const icon = claims.length > 1 ? String(claims.length) : presentation.icon;
 
     const badge = document.createElement('div');
     badge.className = 'veracity-compact-badge';
@@ -516,7 +637,7 @@ function createCompactBadge(element: HTMLElement, claims: FactCheckResult[]): vo
           pointer-events: none;
           transition: all 0.2s ease;
           box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        ">View Details</div>
+        ">View ${claims.length === 1 ? 'Details' : `${claims.length} Claims`}</div>
       </div>
       <style>
         @keyframes badge-pop-in {
@@ -574,7 +695,9 @@ function createCompactBadge(element: HTMLElement, claims: FactCheckResult[]): vo
 
     // No backdrop - panel appears as dropdown next to article
 
-    panel.appendChild(createClaimCard(claim));
+    claims.forEach((claim) => {
+      panel.appendChild(createClaimCard(claim));
+    });
 
     let isOpen = false;
     badge.addEventListener('click', (e) => {
@@ -629,59 +752,88 @@ function createCompactBadge(element: HTMLElement, claims: FactCheckResult[]): vo
 
 function createClaimCard(result: FactCheckResult): HTMLElement {
   const card = document.createElement('div');
-
-  let bgColor, borderColor, textColor, icon;
-  if (result.verdict === 'false') {
-    bgColor = '#fee2e2';
-    borderColor = '#dc2626';
-    textColor = '#991b1b';
-    icon = '❌';
-  } else if (result.verdict === 'context') {
-    bgColor = '#fef3c7';
-    borderColor = '#f59e0b';
-    textColor = '#92400e';
-    icon = '⚠️';
-  } else {
-    bgColor = '#d1fae5';
-    borderColor = '#059669';
-    textColor = '#065f46';
-    icon = '✓';
-  }
+  const presentation = getVerdictPresentation(result.verdict);
 
   card.style.cssText = `
-    background: ${bgColor};
-    border: 2px solid ${borderColor};
+    background: ${presentation.backgroundColor};
+    border: 2px solid ${presentation.borderColor};
     border-radius: 8px;
     padding: 12px;
+    margin-bottom: 12px;
     font-family: system-ui, -apple-system, sans-serif;
     font-size: 13px;
     line-height: 1.5;
-    color: ${textColor};
+    color: ${presentation.textColor};
   `;
 
-  card.innerHTML = `
-    <div style="font-weight: bold; margin-bottom: 10px; text-transform: uppercase; font-size: 11px; display: flex; align-items: center; gap: 6px;">
-      <span style="font-size: 18px;">${icon}</span>
-      <span>${result.verdict}</span>
-    </div>
-    <div style="margin-bottom: 10px;">
-      <div style="font-weight: 600; font-size: 12px; margin-bottom: 4px;">Claim:</div>
-      <div style="font-size: 12px; font-style: italic; opacity: 0.9; line-height: 1.4;">
-        "${result.quote}"
-      </div>
-    </div>
-    <div style="margin-bottom: 10px;">
-      <div style="font-weight: 600; font-size: 12px; margin-bottom: 4px;">Comments:</div>
-      <div style="font-size: 12px; line-height: 1.5;">
-        ${result.comments}
-      </div>
-    </div>
-    <div style="font-size: 11px; opacity: 0.7; padding-top: 10px; border-top: 1px solid ${borderColor}; word-break: break-all; overflow-wrap: break-word;">
-      <strong>Source:</strong> ${result.source}
-    </div>
-  `;
+  const header = document.createElement('div');
+  header.style.cssText = 'font-weight: bold; margin-bottom: 10px; text-transform: uppercase; font-size: 11px; display: flex; align-items: center; gap: 6px;';
+
+  const icon = document.createElement('span');
+  icon.style.fontSize = '18px';
+  icon.textContent = presentation.icon;
+
+  const verdict = document.createElement('span');
+  verdict.textContent = presentation.label;
+
+  header.append(icon, verdict);
+  card.appendChild(header);
+
+  card.appendChild(createDetailSection('Claim:', `"${result.quote}"`, true));
+  card.appendChild(createDetailSection('Comments:', result.comments));
+  card.appendChild(createSourceSection(result.source, presentation.borderColor));
 
   return card;
+}
+
+function createDetailSection(labelText: string, valueText: string, italic = false): HTMLElement {
+  const section = document.createElement('div');
+  section.style.marginBottom = '10px';
+
+  const label = document.createElement('div');
+  label.style.cssText = 'font-weight: 600; font-size: 12px; margin-bottom: 4px;';
+  label.textContent = labelText;
+
+  const value = document.createElement('div');
+  value.style.cssText = `font-size: 12px; line-height: ${italic ? '1.4' : '1.5'}; opacity: 0.9;${italic ? ' font-style: italic;' : ''}`;
+  value.textContent = valueText;
+
+  section.append(label, value);
+  return section;
+}
+
+function createSourceSection(source: string, borderColor: string): HTMLElement {
+  const section = document.createElement('div');
+  section.style.cssText = `font-size: 11px; opacity: 0.7; padding-top: 10px; border-top: 1px solid ${borderColor}; word-break: break-all; overflow-wrap: break-word;`;
+
+  const label = document.createElement('strong');
+  label.textContent = 'Source: ';
+  section.appendChild(label);
+
+  const safeUrl = toSafeHttpUrl(source);
+  if (safeUrl) {
+    const link = document.createElement('a');
+    link.href = safeUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = safeUrl;
+    section.appendChild(link);
+  } else {
+    const text = document.createElement('span');
+    text.textContent = source || 'No reliable source provided';
+    section.appendChild(text);
+  }
+
+  return section;
+}
+
+function toSafeHttpUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 let toastContainer: HTMLElement | null = null;
